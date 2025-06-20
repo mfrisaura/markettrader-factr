@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FIXLink Trading Server</title>
+    <script src="https://unpkg.com/@microsoft/signalr@7.0.0/dist/browser/signalr.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .section { margin: 20px 0; padding: 20px; border: 1px solid #ccc; border-radius: 5px; }
+        .form-group { margin: 10px 0; }
+        label { display: inline-block; width: 150px; }
+        input, select { width: 200px; padding: 5px; }
+        button { padding: 10px 20px; margin: 5px; }
+        .result { margin: 10px 0; padding: 10px; background-color: #f5f5f5; border-radius: 3px; }
+        .error { background-color: #ffe6e6; color: #cc0000; }
+        .success { background-color: #e6ffe6; color: #006600; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>FIXLink Trading Server</h1>
+        
+        <div class="section">
+            <h2>Account Status</h2>
+            <div class="form-group">
+                <label>Account ID:</label>
+                <input type="text" id="accountId" value="ACCT001" />
+                <button onclick="getAccountStatus()">Get Status</button>
+            </div>
+            <div id="accountStatus" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Submit Trade</h2>
+            <div class="form-group">
+                <label>Account ID:</label>
+                <input type="text" id="tradeAccountId" value="ACCT001" />
+            </div>
+            <div class="form-group">
+                <label>Trade Type:</label>
+                <select id="tradeType">
+                    <option value="ShareSell">Share Sell</option>
+                    <option value="DollarSell">Dollar Sell</option>
+                    <option value="SharePurchase">Share Purchase</option>
+                    <option value="DollarPurchase">Dollar Purchase</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Symbol:</label>
+                <input type="text" id="symbol" value="SSNC" />
+            </div>
+            <div class="form-group">
+                <label>Quantity:</label>
+                <input type="number" id="quantity" step="0.001" />
+            </div>
+            <div class="form-group">
+                <label>Dollar Amount:</label>
+                <input type="number" id="dollarAmount" step="0.01" />
+            </div>
+            <button onclick="submitTrade()">Submit Trade</button>
+            <div id="tradeResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Trade History</h2>
+            <button onclick="getTradeHistory()">Refresh</button>
+            <div id="tradeHistory"></div>
+        </div>
+
+        <div class="section">
+            <h2>Update Cash Balance</h2>
+            <div class="form-group">
+                <label>Account ID:</label>
+                <input type="text" id="cashAccountId" value="ACCT001" />
+            </div>
+            <div class="form-group">
+                <label>New Balance:</label>
+                <input type="number" id="newBalance" step="0.01" />
+            </div>
+            <button onclick="updateCashBalance()">Update</button>
+            <div id="cashUpdateResult" class="result"></div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize SignalR connection
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl("/tradinghub")
+            .build();
+
+        connection.start().then(function () {
+            console.log("Connected to trading hub");
+        }).catch(function (err) {
+            console.error(err.toString());
+        });
+
+        // Listen for account updates
+        connection.on("AccountUpdate", function (data) {
+            console.log("Account update received:", data);
+            updateAccountDisplay(data);
+        });
+
+        async function getAccountStatus() {
+            const accountId = document.getElementById('accountId').value;
+            try {
+                const response = await fetch(`/api/trading/account/${accountId}`);
+                const account = await response.json();
+                
+                if (response.ok) {
+                    updateAccountDisplay(account);
+                } else {
+                    showResult('accountStatus', 'Account not found', 'error');
+                }
+            } catch (error) {
+                showResult('accountStatus', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        function updateAccountDisplay(account) {
+            const html = `
+                <h3>Account: ${account.accountId}</h3>
+                <p><strong>Trade Cash Balance:</strong> $${account.tradeCashBalance.toFixed(2)}</p>
+                <p><strong>Starting Balance:</strong> $${account.startingTradeCashBalance.toFixed(2)}</p>
+                <p><strong>Cash Threshold:</strong> $${account.cashThreshold.toFixed(2)}</p>
+                <p><strong>Max Trade Cash Usage:</strong> $${account.maxTradeCashUsage.toFixed(2)}</p>
+                <p><strong>Total Trades:</strong> ${account.trades.length}</p>
+                <p><strong>Last Updated:</strong> ${new Date(account.lastUpdated).toLocaleString()}</p>
+                ${account.tradeCashBalance <= account.cashThreshold ? '<p style="color: red;"><strong>⚠️ Below Threshold!</strong></p>' : ''}
+            `;
+            showResult('accountStatus', html, 'success');
+        }
+
+        async function submitTrade() {
+            const tradeRequest = {
+                accountId: document.getElementById('tradeAccountId').value,
+                type: parseInt(document.getElementById('tradeType').selectedIndex),
+                symbol: document.getElementById('symbol').value,
+                quantity: parseFloat(document.getElementById('quantity').value) || null,
+                dollarAmount: parseFloat(document.getElementById('dollarAmount').value) || null
+            };
+
+            try {
+                const response = await fetch('/api/trading/trade', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(tradeRequest)
+                });
+
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    const html = `
+                        <h3>Trade Submitted Successfully</h3>
+                        <p><strong>Trade ID:</strong> ${result.tradeId}</p>
+                        <p><strong>Status:</strong> ${getStatusText(result.status)}</p>
+                        <p><strong>Executed Quantity:</strong> ${result.executedQuantity || 'N/A'}</p>
+                        <p><strong>Executed Value:</strong> $${(result.executedValue || 0).toFixed(2)}</p>
+                        <p><strong>Cash Covered:</strong> $${(result.cashCovered || 0).toFixed(2)}</p>
+                        <p><strong>Cash Adjustment:</strong> $${(result.cashAdjustment || 0).toFixed(2)}</p>
+                        <p><strong>New Cash Balance:</strong> $${result.newCashBalance.toFixed(2)}</p>
+                    `;
+                    showResult('tradeResult', html, 'success');
+                } else {
+                    showResult('tradeResult', 'Trade failed: ' + result.message, 'error');
+                }
+            } catch (error) {
+                showResult('tradeResult', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        async function getTradeHistory() {
+            const accountId = document.getElementById('accountId').value;
+            try {
+                const response = await fetch(`/api/trading/account/${accountId}/trades`);
+                const trades = await response.json();
+                
+                if (response.ok) {
+                    let html = '<h3>Trade History</h3><table border="1" style="width:100%"><tr><th>Time</th><th>Symbol</th><th>Type</th><th>Qty</th><th>Value</th><th>Status</th><th>Notes</th></tr>';
+                    
+                    trades.forEach(trade => {
+                        html += `<tr>
+                            <td>${new Date(trade.tradeTime).toLocaleString()}</td>
+                            <td>${trade.symbol}</td>
+                            <td>${getTradeTypeText(trade.type)}</td>
+                            <td>${trade.executedQuantity || trade.requestedQuantity}</td>
+                            <td>$${(trade.executedValue || trade.requestedValue).toFixed(2)}</td>
+                            <td>${getStatusText(trade.status)}</td>
+                            <td>${trade.notes || ''}</td>
+                        </tr>`;
+                    });
+                    
+                    html += '</table>';
+                    document.getElementById('tradeHistory').innerHTML = html;
+                } else {
+                    showResult('tradeHistory', 'Error loading trade history', 'error');
+                }
+            } catch (error) {
+                showResult('tradeHistory', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        async function updateCashBalance() {
+            const accountId = document.getElementById('cashAccountId').value;
+            const newBalance = parseFloat(document.getElementById('newBalance').value);
+            
+            try {
+                const response = await fetch(`/api/trading/account/${accountId}/cash-balance`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(newBalance)
+                });
+
+                if (response.ok) {
+                    showResult('cashUpdateResult', 'Cash balance updated successfully', 'success');
+                    // Refresh account status
+                    getAccountStatus();
+                } else {
+                    showResult('cashUpdateResult', 'Failed to update cash balance', 'error');
+                }
+            } catch (error) {
+                showResult('cashUpdateResult', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        function showResult(elementId, message, type) {
+            const element = document.getElementById(elementId);
+            element.innerHTML = message;
+            element.className = `result ${type}`;
+        }
+
+        function getTradeTypeText(type) {
+            const types = ['ShareSell', 'DollarSell', 'SharePurchase', 'DollarPurchase'];
+            return types[type] || 'Unknown';
+        }
+
+        function getStatusText(status) {
+            const statuses = ['Pending', 'ExecutedAtMarket', 'CoveredByCash', 'Rejected', 'PartiallyExecuted'];
+            return statuses[status] || 'Unknown';
+        }
+
+        // Load initial account status
+        window.onload = function() {
+            getAccountStatus();
+        };
+    </script>
+</body>
+</html>
