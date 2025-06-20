@@ -29,9 +29,8 @@ if (!app.Environment.IsDevelopment())
     app.UseHsts();
 }
 
-// Add these lines in this order:
-app.UseDefaultFiles();  // This makes / serve index.html
-app.UseStaticFiles();   // This serves static files
+app.UseHttpsRedirection();
+app.UseStaticFiles();
 app.UseRouting();
 app.UseCors();
 

@@ -4,268 +4,324 @@ namespace FIXLinkTradingServer.Services
 {
     public interface ICashBalanceService
     {
-        Task<TradeResponse> ProcessShareSellAsync(Account account, Trade trade);
-        Task<TradeResponse> ProcessDollarSellAsync(Account account, Trade trade);
-        Task<TradeResponse> ProcessSharePurchaseAsync(Account account, Trade trade);
-        Task<TradeResponse> ProcessDollarPurchaseAsync(Account account, Trade trade);
-        Task UpdateTradeCashBalanceAsync(string accountId, decimal adjustment, string reason);
-        Task<bool> CheckCashThresholdAsync(Account account);
+        Task<CashProcessingResult> ProcessOrderAsync(AccountSymbolBalance symbolBalance, PendingOrder order);
+        Task ProcessExecutionAsync(PendingOrder order);
+        Task<bool> CheckCashThresholdAsync(AccountSymbolBalance symbolBalance);
+        Task UpdateTradeCashBalanceAsync(string accountId, string symbol, decimal newBalance);
+        Task<decimal> GetEODPriceAsync(string symbol);
     }
 
     public class CashBalanceService : ICashBalanceService
     {
         private readonly ILogger<CashBalanceService> _logger;
-        private readonly IFIXLinkService _fixLinkService;
+        private readonly Dictionary<string, decimal> _eodPrices = new();
 
-        public CashBalanceService(ILogger<CashBalanceService> logger, IFIXLinkService fixLinkService)
+        public CashBalanceService(ILogger<CashBalanceService> logger)
         {
             _logger = logger;
-            _fixLinkService = fixLinkService;
+            InitializeEODPrices();
         }
 
-        public async Task<TradeResponse> ProcessShareSellAsync(Account account, Trade trade)
+        private void InitializeEODPrices()
         {
-            // Implementation of Share Sell logic from your workflow
-            _logger.LogInformation($"Processing Share Sell for {trade.RequestedQuantity} shares of {trade.Symbol}");
-            
-            // Calculate fractional shares value using EOD price
-            var fractionalShares = trade.RequestedQuantity % 1;
-            var wholeShares = Math.Floor(trade.RequestedQuantity);
-            var fractionalValue = fractionalShares * trade.EODPrice;
+            // Initialize with sample EOD prices - in production, this would come from market data feed
+            _eodPrices["SSNC"] = 205.00m;
+            _eodPrices["AAPL"] = 150.00m;
+            _eodPrices["MSFT"] = 300.00m;
+        }
 
-            var response = new TradeResponse
-            {
-                TradeId = trade.TradeId,
-                Success = true
-            };
+        public async Task<CashProcessingResult> ProcessOrderAsync(AccountSymbolBalance symbolBalance, PendingOrder order)
+        {
+            _logger.LogInformation($"Processing {order.Type} order for {order.Symbol} in account {order.AccountId}");
 
-            // Check if we have enough trade cash for fractional shares
-            if (fractionalShares > 0 && account.TradeCashBalance >= fractionalValue)
+            var eodPrice = await GetEODPriceAsync(order.Symbol);
+            var result = new CashProcessingResult { Success = true };
+
+            switch (order.Type)
             {
-                // Cover fractional shares with trade cash
-                trade.CashCovered = fractionalValue;
-                trade.ExecutedQuantity = wholeShares;
-                trade.Notes = $"Fractional shares ({fractionalShares}) covered by trade cash (${fractionalValue:F2})";
-                
-                // Send whole shares to BNY
-                if (wholeShares > 0)
+                case TradeType.ShareSell:
+                    result = await ProcessShareSellOrderAsync(symbolBalance, order, eodPrice);
+                    break;
+
+                case TradeType.DollarSell:
+                    result = await ProcessDollarSellOrderAsync(symbolBalance, order);
+                    break;
+
+                case TradeType.SharePurchase:
+                    result = await ProcessSharePurchaseOrderAsync(symbolBalance, order, eodPrice);
+                    break;
+
+                case TradeType.DollarPurchase:
+                    result = await ProcessDollarPurchaseOrderAsync(symbolBalance, order);
+                    break;
+
+                default:
+                    result.Success = false;
+                    result.Message = $"Unsupported trade type: {order.Type}";
+                    break;
+            }
+
+            // Update last activity time
+            symbolBalance.LastUpdated = DateTime.Now;
+
+            // Check threshold after processing
+            await CheckCashThresholdAsync(symbolBalance);
+
+            return result;
+        }
+
+        private async Task<CashProcessingResult> ProcessShareSellOrderAsync(AccountSymbolBalance symbolBalance, PendingOrder order, decimal eodPrice)
+        {
+            // SS&C Share Sell Logic:
+            // 1. Calculate fractional shares value using EOD price
+            // 2. Check if trade cash can cover fractional shares
+            // 3. Send whole shares to BNY, cover fractional with cash
+
+            var fractionalShares = order.RequestedQuantity % 1;
+            var wholeShares = Math.Floor(order.RequestedQuantity);
+            var fractionalValue = fractionalShares * eodPrice;
+
+            var result = new CashProcessingResult { Success = true };
+
+            if (fractionalShares > 0)
+            {
+                // Check if we have enough available cash for fractional shares
+                if (symbolBalance.AvailableCash >= fractionalValue)
                 {
-                    var bnyResult = await _fixLinkService.SendTradeToMarketAsync(trade.Symbol, wholeShares, "2"); // Sell
-                    trade.ExecutedValue = bnyResult.ExecutedValue;
-                    trade.ExecutedPrice = bnyResult.ExecutedPrice;
-                    trade.SentToBNY = true;
-                    trade.Status = TradeStatus.ExecutedAtMarket;
+                    // Cover fractional shares with trade cash
+                    order.CashAllocated = fractionalValue;
+                    order.SentQuantity = wholeShares;
+                    order.SentValue = wholeShares * eodPrice;
+                    order.Notes = $"Fractional shares ({fractionalShares:F3}) covered by trade cash (${fractionalValue:F2})";
+
+                    // Reserve the cash
+                    symbolBalance.PendingCashReduction += fractionalValue;
+
+                    // Send whole shares to market if any
+                    result.ShouldSendToMarket = wholeShares > 0;
+                    result.CashCovered = fractionalValue;
+                    result.Message = order.Notes;
+
+                    _logger.LogInformation($"Share Sell: Covering {fractionalShares:F3} fractional shares with ${fractionalValue:F2} trade cash");
                 }
                 else
                 {
-                    trade.Status = TradeStatus.CoveredByCash;
+                    // Insufficient trade cash for fractional shares
+                    result.Success = false;
+                    result.Message = $"Insufficient trade cash (${symbolBalance.AvailableCash:F2}) for fractional shares requiring ${fractionalValue:F2}";
+                    order.Notes = result.Message;
                 }
-
-                // Reduce trade cash
-                account.TradeCashBalance -= fractionalValue;
-                
-                response.CashCovered = fractionalValue;
-                response.ExecutedQuantity = trade.ExecutedQuantity;
-                response.ExecutedValue = trade.ExecutedValue;
-                response.Status = trade.Status;
-                response.NewCashBalance = account.TradeCashBalance;
-            }
-            else if (fractionalShares > 0)
-            {
-                // Insufficient trade cash
-                trade.Status = TradeStatus.Rejected;
-                trade.Notes = $"Insufficient trade cash (${account.TradeCashBalance:F2}) for fractional shares requiring ${fractionalValue:F2}";
-                response.Success = false;
-                response.Message = trade.Notes;
-                response.Status = TradeStatus.Rejected;
             }
             else
             {
-                // No fractional shares, send all to BNY
-                var bnyResult = await _fixLinkService.SendTradeToMarketAsync(trade.Symbol, trade.RequestedQuantity, "2");
-                trade.ExecutedValue = bnyResult.ExecutedValue;
-                trade.ExecutedPrice = bnyResult.ExecutedPrice;
-                trade.ExecutedQuantity = bnyResult.ExecutedQuantity;
-                trade.SentToBNY = true;
-                trade.Status = TradeStatus.ExecutedAtMarket;
-                
-                response.ExecutedQuantity = trade.ExecutedQuantity;
-                response.ExecutedValue = trade.ExecutedValue;
-                response.Status = trade.Status;
+                // No fractional shares, send entire quantity to market
+                order.SentQuantity = order.RequestedQuantity;
+                order.SentValue = order.RequestedQuantity * eodPrice;
+                order.CashAllocated = 0;
+                result.ShouldSendToMarket = true;
+                result.Message = "Sending entire quantity to market";
             }
 
-            await CheckCashThresholdAsync(account);
-            return response;
+            return result;
         }
 
-        public async Task<TradeResponse> ProcessDollarSellAsync(Account account, Trade trade)
+        private async Task<CashProcessingResult> ProcessDollarSellOrderAsync(AccountSymbolBalance symbolBalance, PendingOrder order)
         {
-            _logger.LogInformation($"Processing Dollar Sell for ${trade.RequestedValue}");
-            
-            // Calculate amount to send to BNY (requested amount minus available trade cash up to limit)
-            var tradeCashToUse = Math.Min(account.TradeCashBalance, Math.Min(account.MaxTradeCashUsage, trade.RequestedValue));
-            var amountToBNY = trade.RequestedValue - tradeCashToUse;
+            // SS&C Dollar Sell Logic:
+            // 1. Take available trade cash and subtract from dollar amount before sending to BNY
+            // 2. There is a limit in the amount of trade cash that can be used (MaxTradeCashUsage)
 
-            var response = new TradeResponse
-            {
-                TradeId = trade.TradeId,
-                Success = true
-            };
+            var maxCashUsage = Math.Min(symbolBalance.AvailableCash, order.RequestedValue);
+            var tradeCashToUse = Math.Min(maxCashUsage, symbolBalance.Account?.MaxTradeCashUsage ?? 1000m);
+            var amountToMarket = order.RequestedValue - tradeCashToUse;
 
-            if (amountToBNY > 0)
+            var result = new CashProcessingResult { Success = true };
+
+            if (amountToMarket > 0)
             {
-                // Send reduced amount to BNY
-                var bnyResult = await _fixLinkService.SendDollarTradeToMarketAsync(trade.Symbol, amountToBNY, "2"); // Sell
-                trade.ExecutedValue = bnyResult.ExecutedValue;
-                trade.ExecutedQuantity = bnyResult.ExecutedQuantity;
-                trade.ExecutedPrice = bnyResult.ExecutedPrice;
-                trade.SentToBNY = true;
-                
-                // Calculate cash adjustment (difference between what we sent and what was executed)
-                var cashAdjustment = amountToBNY - trade.ExecutedValue;
-                trade.CashAdjustment = cashAdjustment;
-                
-                // Update trade cash balance
-                account.TradeCashBalance -= tradeCashToUse; // Remove what we used
-                account.TradeCashBalance += cashAdjustment; // Add back the difference
-                
-                trade.Status = TradeStatus.ExecutedAtMarket;
-                trade.Notes = $"Used ${tradeCashToUse:F2} trade cash, sent ${amountToBNY:F2} to BNY, cash adjustment: ${cashAdjustment:F2}";
+                // Send reduced amount to market
+                order.SentValue = amountToMarket;
+                order.CashAllocated = tradeCashToUse;
+                order.Notes = $"Using ${tradeCashToUse:F2} trade cash, sending ${amountToMarket:F2} to market";
+
+                // Reserve the cash
+                symbolBalance.PendingCashReduction += tradeCashToUse;
+
+                result.ShouldSendToMarket = true;
+                result.CashCovered = tradeCashToUse;
+                result.Message = order.Notes;
+
+                _logger.LogInformation($"Dollar Sell: Using ${tradeCashToUse:F2} trade cash, sending ${amountToMarket:F2} to market");
             }
             else
             {
                 // Entire amount covered by trade cash
-                trade.CashCovered = trade.RequestedValue;
-                trade.ExecutedValue = trade.RequestedValue;
-                trade.Status = TradeStatus.CoveredByCash;
-                account.TradeCashBalance -= trade.RequestedValue;
-                trade.Notes = $"Entire amount (${trade.RequestedValue:F2}) covered by trade cash";
+                order.SentValue = 0;
+                order.CashAllocated = order.RequestedValue;
+                order.Notes = $"Entire amount (${order.RequestedValue:F2}) covered by trade cash";
+
+                // Reserve the cash
+                symbolBalance.PendingCashReduction += order.RequestedValue;
+
+                result.ShouldSendToMarket = false;
+                result.CashCovered = order.RequestedValue;
+                result.Message = order.Notes;
+
+                _logger.LogInformation($"Dollar Sell: Entire amount ${order.RequestedValue:F2} covered by trade cash");
             }
 
-            response.ExecutedValue = trade.ExecutedValue;
-            response.ExecutedQuantity = trade.ExecutedQuantity;
-            response.CashCovered = tradeCashToUse;
-            response.CashAdjustment = trade.CashAdjustment;
-            response.Status = trade.Status;
-            response.NewCashBalance = account.TradeCashBalance;
-
-            await CheckCashThresholdAsync(account);
-            return response;
+            return result;
         }
 
-        public async Task<TradeResponse> ProcessSharePurchaseAsync(Account account, Trade trade)
+        private async Task<CashProcessingResult> ProcessSharePurchaseOrderAsync(AccountSymbolBalance symbolBalance, PendingOrder order, decimal eodPrice)
         {
-            _logger.LogInformation($"Processing Share Purchase for {trade.RequestedQuantity} shares of {trade.Symbol}");
-            
-            // Calculate value using EOD price
-            var shareValue = trade.RequestedQuantity * trade.EODPrice;
-            
-            var response = new TradeResponse
-            {
-                TradeId = trade.TradeId,
-                Success = true
-            };
+            // SS&C Share Purchase Logic:
+            // 1. Due to the size of the trade and rules, decide whether to send to BNY
+            // 2. If not sending to BNY, calculate value using EOD price and add to trade cash
 
-            // Check if trade should be sent to BNY based on size and rules
-            if (ShouldSendToBNY(trade.RequestedQuantity, shareValue))
+            var shareValue = order.RequestedQuantity * eodPrice;
+            var result = new CashProcessingResult { Success = true };
+
+            // Business rule: Don't send very small trades to market
+            var shouldSendToMarket = ShouldSendToBNY(order.RequestedQuantity, shareValue);
+
+            if (shouldSendToMarket)
             {
-                var bnyResult = await _fixLinkService.SendTradeToMarketAsync(trade.Symbol, trade.RequestedQuantity, "1"); // Buy
-                trade.ExecutedValue = bnyResult.ExecutedValue;
-                trade.ExecutedQuantity = bnyResult.ExecutedQuantity;
-                trade.ExecutedPrice = bnyResult.ExecutedPrice;
-                trade.SentToBNY = true;
-                trade.Status = TradeStatus.ExecutedAtMarket;
+                // Send to market
+                order.SentQuantity = order.RequestedQuantity;
+                order.SentValue = shareValue;
+                order.CashAllocated = 0;
+                order.Notes = $"Sending {order.RequestedQuantity:F3} shares to market";
+
+                result.ShouldSendToMarket = true;
+                result.Message = order.Notes;
+
+                _logger.LogInformation($"Share Purchase: Sending {order.RequestedQuantity:F3} shares (${shareValue:F2}) to market");
             }
             else
             {
-                // Don't send to BNY, calculate value and add to trade cash
-                trade.ExecutedValue = shareValue;
-                trade.ExecutedQuantity = trade.RequestedQuantity;
-                trade.ExecutedPrice = trade.EODPrice;
-                trade.SentToBNY = false;
-                trade.Status = TradeStatus.CoveredByCash;
-                
-                // Add value to available trade cash
-                account.TradeCashBalance += shareValue;
-                trade.Notes = $"Small trade not sent to BNY. Value ${shareValue:F2} added to trade cash";
+                // Don't send to market, add value to trade cash
+                order.SentQuantity = 0;
+                order.SentValue = 0;
+                order.CashAllocated = 0;
+                order.Notes = $"Small trade not sent to market. Value ${shareValue:F2} will be added to trade cash";
+
+                // We'll add to cash balance when this "executes" (immediately)
+                result.ShouldSendToMarket = false;
+                result.CashAdjustment = shareValue;
+                result.Message = order.Notes;
+
+                _logger.LogInformation($"Share Purchase: Small trade {order.RequestedQuantity:F3} shares (${shareValue:F2}) not sent to market");
             }
 
-            response.ExecutedQuantity = trade.ExecutedQuantity;
-            response.ExecutedValue = trade.ExecutedValue;
-            response.Status = trade.Status;
-            response.NewCashBalance = account.TradeCashBalance;
-
-            await CheckCashThresholdAsync(account);
-            return response;
+            return result;
         }
 
-        public async Task<TradeResponse> ProcessDollarPurchaseAsync(Account account, Trade trade)
+        private async Task<CashProcessingResult> ProcessDollarPurchaseOrderAsync(AccountSymbolBalance symbolBalance, PendingOrder order)
         {
-            _logger.LogInformation($"Processing Dollar Purchase for ${trade.RequestedValue}");
+            // SS&C Dollar Purchase Logic:
+            // 1. Add available trade cash to purchase amount and send to BNY
+
+            var totalAmountToMarket = order.RequestedValue + symbolBalance.AvailableCash;
             
-            // Add available trade cash to purchase amount
-            var totalAmountToBNY = trade.RequestedValue + account.TradeCashBalance;
+            var result = new CashProcessingResult { Success = true };
+
+            order.SentValue = totalAmountToMarket;
+            order.CashAllocated = symbolBalance.AvailableCash; // We're using all available cash
+            order.Notes = $"Sending ${totalAmountToMarket:F2} (${order.RequestedValue:F2} + ${symbolBalance.AvailableCash:F2} trade cash) to market";
+
+            // Reserve all available cash
+            symbolBalance.PendingCashReduction += symbolBalance.AvailableCash;
+
+            result.ShouldSendToMarket = true;
+            result.CashCovered = symbolBalance.AvailableCash;
+            result.Message = order.Notes;
+
+            _logger.LogInformation($"Dollar Purchase: Sending ${totalAmountToMarket:F2} (includes ${symbolBalance.AvailableCash:F2} trade cash) to market");
+
+            return result;
+        }
+
+        public async Task ProcessExecutionAsync(PendingOrder order)
+        {
+            _logger.LogInformation($"Processing execution for order {order.ClientOrderId}: {order.ExecutedQuantity} @ ${order.ExecutedValue:F2}");
+
+            // Get the symbol balance to update cash
+            // Note: We'll need a way to get the account/symbol balance here
+            // For now, we'll log the cash adjustment that needs to be made
+
+            var cashAdjustment = CalculateCashAdjustment(order);
             
-            var response = new TradeResponse
+            if (cashAdjustment != 0)
             {
-                TradeId = trade.TradeId,
-                Success = true
-            };
+                _logger.LogInformation($"Cash adjustment for order {order.ClientOrderId}: ${cashAdjustment:F2}");
+                // TODO: Apply cash adjustment to the appropriate symbol balance
+            }
 
-            // Send enhanced amount to BNY
-            var bnyResult = await _fixLinkService.SendDollarTradeToMarketAsync(trade.Symbol, totalAmountToBNY, "1"); // Buy
-            trade.ExecutedValue = bnyResult.ExecutedValue;
-            trade.ExecutedQuantity = bnyResult.ExecutedQuantity;
-            trade.ExecutedPrice = bnyResult.ExecutedPrice;
-            trade.SentToBNY = true;
-            
-            // Calculate cash adjustment (difference between what we sent and what was executed)
-            var cashAdjustment = totalAmountToBNY - trade.ExecutedValue;
-            trade.CashAdjustment = cashAdjustment;
-            
-            // Update trade cash balance (use all existing cash + add back the difference)
-            account.TradeCashBalance = cashAdjustment;
-            
-            trade.Status = TradeStatus.ExecutedAtMarket;
-            trade.Notes = $"Sent ${totalAmountToBNY:F2} (${trade.RequestedValue:F2} + ${account.TradeCashBalance:F2} trade cash) to BNY, " +
-                         $"executed ${trade.ExecutedValue:F2}, cash adjustment: ${cashAdjustment:F2}";
-
-            response.ExecutedValue = trade.ExecutedValue;
-            response.ExecutedQuantity = trade.ExecutedQuantity;
-            response.CashAdjustment = trade.CashAdjustment;
-            response.Status = trade.Status;
-            response.NewCashBalance = account.TradeCashBalance;
-
-            await CheckCashThresholdAsync(account);
-            return response;
-        }
-
-        public async Task UpdateTradeCashBalanceAsync(string accountId, decimal adjustment, string reason)
-        {
-            _logger.LogInformation($"Updating trade cash balance for account {accountId}: {adjustment:F2} - {reason}");
-            // Implementation would update the account balance
             await Task.CompletedTask;
         }
 
-        public async Task<bool> CheckCashThresholdAsync(Account account)
+        private decimal CalculateCashAdjustment(PendingOrder order)
         {
-            if (account.TradeCashBalance <= account.CashThreshold && !account.ThresholdAlertSent)
+            decimal adjustment = 0;
+
+            switch (order.Type)
             {
-                _logger.LogWarning($"Trade cash balance for account {account.AccountId} is below threshold: ${account.TradeCashBalance:F2}");
-                account.ThresholdAlertSent = true;
-                // Send alert to PCS or admin
-                return true;
+                case TradeType.ShareSell:
+                    // Release allocated cash, no additional adjustment needed
+                    adjustment = 0;
+                    break;
+
+                case TradeType.DollarSell:
+                    // Add back the difference between what we sent and what was executed
+                    adjustment = order.SentValue - order.ExecutedValue;
+                    break;
+
+                case TradeType.SharePurchase:
+                    if (!order.SentToMarket)
+                    {
+                        // Add the calculated share value to cash balance
+                        var eodPrice = GetEODPriceAsync(order.Symbol).Result;
+                        adjustment = order.RequestedQuantity * eodPrice;
+                    }
+                    break;
+
+                case TradeType.DollarPurchase:
+                    // Add back the difference between what we sent and what was executed
+                    adjustment = order.SentValue - order.ExecutedValue;
+                    break;
             }
-            else if (account.TradeCashBalance > account.CashThreshold)
+
+            return adjustment;
+        }
+
+        public async Task<bool> CheckCashThresholdAsync(AccountSymbolBalance symbolBalance)
+        {
+            if (symbolBalance.TradeCashBalance <= symbolBalance.CashThreshold)
             {
-                account.ThresholdAlertSent = false;
+                _logger.LogWarning($"Trade cash balance for {symbolBalance.AccountId}:{symbolBalance.Symbol} is below threshold: ${symbolBalance.TradeCashBalance:F2}");
+                // TODO: Send alert to appropriate parties
+                return true;
             }
             return false;
         }
 
+        public async Task UpdateTradeCashBalanceAsync(string accountId, string symbol, decimal newBalance)
+        {
+            _logger.LogInformation($"Updating trade cash balance for {accountId}:{symbol} to ${newBalance:F2}");
+            // TODO: Update the actual balance in storage
+            await Task.CompletedTask;
+        }
+
+        public async Task<decimal> GetEODPriceAsync(string symbol)
+        {
+            await Task.CompletedTask;
+            return _eodPrices.TryGetValue(symbol, out var price) ? price : 100.00m;
+        }
+
         private bool ShouldSendToBNY(decimal quantity, decimal value)
         {
-            // Business rules to determine if trade should go to BNY
+            // Business rules for determining if trade should go to market
             // Example: Don't send very small trades
             return value > 50.00m && quantity > 0.5m;
         }

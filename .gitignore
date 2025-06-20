@@ -1,4 +1,40 @@
+<<<<<<< HEAD
 bin/ 
 obj/ 
 .vs/ 
 *.user 
+=======
+# Create .gitignore for .NET projects
+echo "## Ignore Visual Studio temporary files, build results
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio 2015/2017 cache/options directory
+.vs/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# ASP.NET Scaffolding
+ScaffoldingReadMe.txt
+
+# Custom ignores
+appsettings.Development.json
+appsettings.Production.json
+*.pem
+_backup_*/" > .gitignore
+>>>>>>> 3a2d6788991d2a44d56d70ff745a1e819415eccd
